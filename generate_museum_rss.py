@@ -1,28 +1,37 @@
-import requests
+import time
+import re
+import hashlib
 from bs4 import BeautifulSoup
 from feedgen.feed import FeedGenerator
 from datetime import datetime
 import pytz
-import re
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 url = "https://museum.or.kr/news/"
 base_url = "https://museum.or.kr"
 
-# 1. 웹페이지 접속 (봇 차단 방지 헤더)
-headers = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
-}
+print("크롬 브라우저를 시작합니다...")
+chrome_options = Options()
+chrome_options.add_argument('--headless')
+chrome_options.add_argument('--no-sandbox')
+chrome_options.add_argument('--disable-dev-shm-usage')
+chrome_options.add_argument('--window-size=1920,1080')
+chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36')
 
-print("한국박물관협회 접속 중...")
-response = requests.get(url, headers=headers, timeout=15)
-response.raise_for_status()
+service = Service(ChromeDriverManager().install())
+driver = webdriver.Chrome(service=service, options=chrome_options)
 
-# 사이트 인코딩이 utf-8이 아닐 수 있으므로 확인 (필요시 'euc-kr' 등으로 변경)
-response.encoding = 'utf-8' 
-soup = BeautifulSoup(response.text, 'html.parser')
+print("웹페이지에 접속하여 자바스크립트 렌더링을 기다립니다...")
+driver.get(url)
+time.sleep(8) # 충분한 로딩 시간 부여
 
-# 2. RSS 피드 생성기 초기화
+html = driver.page_source
+soup = BeautifulSoup(html, 'html.parser')
+driver.quit()
+
 fg = FeedGenerator()
 fg.id(url)
 fg.title('한국박물관협회 공지사항 RSS')
@@ -31,56 +40,73 @@ fg.link(href=url, rel='alternate')
 fg.description('한국박물관협회 소식 및 공지사항을 제공합니다.')
 fg.language('ko')
 
-# 3. 게시글 파싱
-# 보통 <table> 내의 <tr> 또는 <ul class="board_list"> 내의 <li> 형태입니다.
-# 두 가지 가능성을 모두 열어두고 탐색합니다.
-rows = soup.select('table tbody tr')
-if not rows:
-    rows = soup.select('.board-list li, .list_wrap > div, .board_wrap tbody tr')
-
+links = soup.find_all('a')
+added_links = set()
 items_found = 0
 
-for row in rows:
-    title_element = row.find('a')
-    if not title_element:
+for a in links:
+    href = a.get('href', '')
+    title = a.get_text(separator=' ', strip=True)
+    
+    # 의미 없는 링크나 메뉴 필터링
+    if not href or len(title) < 5:
+        continue
+    
+    junk_words = ['기관소개', '입회안내', '회원관', '국제활동', '자료실', '개인정보처리방침', '이용약관']
+    if any(junk in title for junk in junk_words):
         continue
 
-    # 제목 정제
-    title = title_element.get_text(separator=' ', strip=True)
+    # 1. 좁은 범위 내에서 날짜 찾기
+    date_str = ""
+    row_container = a.find_parent(['tr', 'li'])
     
-    # "New" 아이콘 텍스트 제거 등 정제 (이미지 대체 텍스트가 딸려올 수 있음)
+    if not row_container:
+        curr = a.parent
+        for _ in range(4):
+            if not curr or curr.name in ['body', 'html']:
+                break
+            # 텍스트가 300자 미만인 블록 안에서 날짜 찾기
+            if len(curr.get_text(strip=True)) < 300:
+                if re.search(r'20\d{2}[-./]\d{2}[-./]\d{2}|([01]\d|2[0-3]):([0-5]\d)', curr.get_text()):
+                    row_container = curr
+                    break
+            curr = curr.parent
+
+    if row_container:
+        row_text = row_container.get_text(separator=' ')
+        date_match = re.search(r'(20\d{2}[-./]\d{2}[-./]\d{2})', row_text)
+        time_match = re.search(r'([01]\d|2[0-3]):([0-5]\d)', row_text)
+        
+        if date_match:
+            date_str = date_match.group(1).replace('.', '-').replace('/', '-')
+        elif time_match:
+            # 시간만 표기된 경우 오늘 날짜로 처리
+            date_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d')
+
+    if not date_str:
+        continue
+
+    # 2. 제목 정제
     title = re.sub(r'^(공지사항|New)\s*', '', title, flags=re.IGNORECASE).strip()
 
-    # 링크 추출
-    href = title_element.get('href', '')
+    # 3. 고유 링크 생성
     if href.startswith('/'):
         link = base_url + href
     elif href.startswith('http'):
         link = href
+    elif 'javascript' in href or href == '#' or not href:
+        onclick = a.get('onclick') or ''
+        nums = re.findall(r"\d+", onclick)
+        link = f"{url}?id={nums[0]}" if nums else f"{url}#{hashlib.md5(title.encode()).hexdigest()[:8]}"
     else:
-        # 상대경로(예: view.php?id=123)일 경우
+        # 상대경로일 경우
         link = f"{url.rstrip('/')}/{href}"
 
-    # 날짜 추출
-    date_str = ""
-    # 전체 row 텍스트에서 날짜 형식(2026.03.20) 또는 시간 형식(09:56) 찾기
-    row_text = row.get_text(separator=' ')
-    
-    date_match = re.search(r'20\d{2}[-./]\d{2}[-./]\d{2}', row_text)
-    time_match = re.search(r'([01]\d|2[0-3]):([0-5]\d)', row_text)
-    
-    if date_match:
-        # 2026.03.20 형식
-        date_str = date_match.group().replace('.', '-').replace('/', '-')
-    elif time_match:
-        # 오늘 날짜인 경우 시간(09:56)만 표시되는 경우가 있음
-        # 이 경우 스크립트 실행 당일의 날짜를 부여
-        date_str = datetime.now(pytz.timezone('Asia/Seoul')).strftime('%Y-%m-%d')
-    else:
-        # 날짜를 전혀 찾지 못하면 패스
+    if link in added_links:
         continue
+    added_links.add(link)
 
-    # 4. RSS 엔트리 추가 (order='append'로 읽어온 순서대로 추가)
+    # 4. RSS 항목 추가
     fe = fg.add_entry(order='append')
     fe.id(link)
     fe.title(title)
@@ -94,12 +120,8 @@ for row in rows:
             fe.pubDate(dt)
         except ValueError:
             pass
-
+            
     items_found += 1
 
-print(f"탐색 완료: 총 {items_found}개의 게시글을 찾았습니다.")
-
-# 5. XML 파일 저장
-xml_filename = 'museum_rss.xml'
-fg.rss_file(xml_filename)
-print(f"RSS 피드 생성 완료: {xml_filename}")
+print(f"탐색 완료: 총 {items_found}개의 공지사항을 찾았습니다.")
+fg.rss_file('museum_rss.xml')
